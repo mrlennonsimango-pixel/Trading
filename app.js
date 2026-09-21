@@ -10,6 +10,16 @@ const candleCount = document.getElementById("candleCount");
 const chartTitle = document.getElementById("chartTitle");
 const dataStatus = document.getElementById("dataStatus");
 const chartArea = document.getElementById("chartArea");
+const backtestButton = document.getElementById("backtestButton");
+const backtestStatus = document.getElementById("backtestStatus");
+const fastLengthInput = document.getElementById("fastLength");
+const slowLengthInput = document.getElementById("slowLength");
+const rsiLengthInput = document.getElementById("rsiLength");
+const rrInput = document.getElementById("rr");
+const btTrades = document.getElementById("btTrades");
+const btWinRate = document.getElementById("btWinRate");
+const btPnl = document.getElementById("btPnl");
+const btEquity = document.getElementById("btEquity");
 
 let markets = [];
 let timeframes = [];
@@ -304,6 +314,42 @@ async function requestHistory(end, count) {
   return normaliseCandles(data.candles || []);
 }
 
+async function runBacktest() {
+  const market = selectedMarketObject();
+  const timeframe = selectedTimeframeObject();
+  if (!market || !timeframe) return;
+
+  backtestButton.disabled = true;
+  backtestStatus.textContent = "Running backtest across D1 history...";
+
+  try {
+    const params = new URLSearchParams({
+      symbol: market.symbol,
+      timeframe: timeframe.value,
+      limit: "5000",
+      fast: fastLengthInput.value,
+      slow: slowLengthInput.value,
+      rsiLength: rsiLengthInput.value,
+      rr: rrInput.value
+    });
+
+    const response = await fetch(`/api/backtest?${params}`);
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || "Backtest failed");
+
+    const result = data.result;
+    btTrades.textContent = result.trades;
+    btWinRate.textContent = `${result.winRate.toFixed(2)}%`;
+    btPnl.textContent = result.netPnl.toFixed(2);
+    btEquity.textContent = result.finalEquity.toFixed(2);
+    backtestStatus.textContent = `Tested ${data.candlesTested} candles using ${market.name} · ${timeframe.label}.`;
+  } catch (error) {
+    backtestStatus.textContent = error.message;
+  } finally {
+    backtestButton.disabled = false;
+  }
+}
+
 async function loadMarketData() {
   const market = selectedMarketObject();
   const timeframe = selectedTimeframeObject();
@@ -408,6 +454,7 @@ timeframeSelect.addEventListener("change", () => {
   loadMarketData();
 });
 loadButton.addEventListener("click", loadMarketData);
+backtestButton.addEventListener("click", runBacktest);
 loadOlderButton.addEventListener("click", loadOlderHistory);
 
 initialise();
