@@ -94,6 +94,222 @@ async function saveSingleCandle(env, symbol, timeframe, candle) {
   ).run();
 }
 
+function sma(values, length, index) {
+  if (index + 1 < length) return null;
+  let sum = 0;
+  for (let i = index - length + 1; i <= index; i++) sum += values[i];
+  return sum / length;
+}
+
+function rsi(closes, length, index) {
+  if (index < length) return null;
+  let gains = 0;
+  let losses = 0;
+  for (let i = index - length + 1; i <= index; i++) {
+    const change = closes[i] - closes[i - 1];
+    if (change > 0) gains += change;
+    else losses -= change;
+  }
+  if (losses === 0) return 100;
+  const rs = (gains / length) / (losses / length);
+  return 100 - (100 / (1 + rs));
+}
+
+function runBacktest(candles, settings) {
+  const fastLength = settings.fastLength;
+  const slowLength = settings.slowLength;
+  const rsiLength = settings.rsiLength;
+  const rsiLong = settings.rsiLong;
+  const rsiShort = settings.rsiShort;
+  const atrLength = settings.atrLength;
+  const atrMultiplier = settings.atrMultiplier;
+  const rr = settings.rr;
+  const initialCapital = settings.initialCapital;
+
+  const closes = candles.map(c => c.close);
+  const trades = [];
+  let equity = initialCapital;
+  let position = null;
+
+  const trueRanges = candles.map((c, i) => {
+    if (i === 0) return c.high - c.low;
+    return Math.max(
+      c.high - c.low,
+      Math.abs(c.high - candles[i - 1].close),
+      Math.abs(c.low - candles[i - 1].close)
+    );
+  });
+
+  for (let i = 1; i < candles.length; i++) {
+    const fast = sma(closes, fastLength, i);
+    const slow = sma(closes, slowLength, i);
+    const prevFast = sma(closes, fastLength, i - 1);
+    const prevSlow = sma(closes, slowLength, i - 1);
+    const currentRsi = rsi(closes, rsiLength, i);
+
+    if (fast == null || slow == null || prevFast == null || prevSlow == null || currentRsi == null) continue;
+
+    let atr = null;
+    if (i + 1 >= atrLength) {
+      let sum = 0;
+      for (let j = i - atrLength + 1; j <= i; j++) sum += trueRanges[j];
+      atr = sum / atrLength;
+    }
+    if (atr == null) continue;
+
+    if (position) {
+      const hitStop = position.side === "long"
+        ? candles[i].low <= position.sl
+        : candles[i].high >= position.sl;
+      const hitTarget = position.side === "long"
+        ? candles[i].high >= position.tp
+        : candles[i].low <= position.tp;
+
+      // Conservative same-candle handling: if both levels are touched,
+      // count the stop first because candle order is unknown.
+      if (hitStop || hitTarget) {
+        const exitPrice = hitStop ? position.sl : position.tp;
+        const pnl = position.side === "long"
+          ? exitPrice - position.entry
+          : position.entry - exitPrice;
+
+        equity += pnl;
+        trades.push({
+          entryTime: position.entryTime,
+          exitTime: candles[i].timestamp,
+          side: position.side,
+          entry: position.entry,
+          sl: position.sl,
+          tp: position.tp,
+          exit: exitPrice,
+          pnl,
+          result: pnl >= 0 ? "win" : "loss"
+        });
+        position = null;
+      }
+    }
+
+    if (!position) {
+      const bullishCross = prevFast <= prevSlow && fast > slow;
+      const bearishCross = prevFast >= prevSlow && fast < slow;
+
+      if (bullishCross && currentRsi >= rsiLong) {
+        const entry = candles[i].close;
+        const risk = atr * atrMultiplier;
+        position = {
+          side: "long",
+          entry,
+          sl: entry - risk,
+          tp: entry + risk * rr,
+          entryTime: candles[i].timestamp
+        };
+      } else if (bearishCross && currentRsi <= rsiShort) {
+        const entry = candles[i].close;
+        const risk = atr * atrMultiplier;
+        position = {
+          side: "short",
+          entry,
+          sl: entry + risk,
+          tp: entry - risk * rr,
+          entryTime: candles[i].timestamp
+        };
+      }
+    }
+  }
+
+  const wins = trades.filter(t => t.result === "win").length;
+  const losses = trades.filter(t => t.result === "loss").length;
+  const netPnl = equity - initialCapital;
+  const winRate = trades.length ? (wins / trades.length) * 100 : 0;
+
+  return {
+    initialCapital,
+    finalEquity: equity,
+    netPnl,
+    trades: trades.length,
+    wins,
+    losses,
+    winRate,
+    openPosition: position
+  };
+}
+
+async function handleBacktest(request, env) {
+  const url = new URL(request.url);
+  const symbol = url.searchParams.get("symbol");
+  const timeframe = Number(url.searchParams.get("timeframe"));
+  const limit = Math.min(Math.max(Number(url.searchParams.get("limit") || 5000), 100), 5000);
+
+  const validationError = validateMarketAndTimeframe(symbol, timeframe);
+  if (validationError) return json({ ok: false, error: validationError }, 400);
+
+  if (!env.DB) return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
+
+  const fastLength = Math.min(Math.max(Number(url.searchParams.get("fast") || 20), 2), 200);
+  const slowLength = Math.min(Math.max(Number(url.searchParams.get("slow") || 50), fastLength + 1), 500);
+  const rsiLength = Math.min(Math.max(Number(url.searchParams.get("rsiLength") || 14), 2), 100);
+  const rsiLong = Math.min(Math.max(Number(url.searchParams.get("rsiLong") || 50), 1), 99);
+  const rsiShort = Math.min(Math.max(Number(url.searchParams.get("rsiShort") || 50), 1), 99);
+  const atrLength = Math.min(Math.max(Number(url.searchParams.get("atrLength") || 14), 2), 100);
+  const atrMultiplier = Math.min(Math.max(Number(url.searchParams.get("atrMultiplier") || 1), 0.1), 10);
+  const rr = Math.min(Math.max(Number(url.searchParams.get("rr") || 3), 0.1), 20);
+  const initialCapital = Math.max(Number(url.searchParams.get("initialCapital") || 1000), 1);
+
+  const result = await env.DB.prepare(
+    `SELECT timestamp, open, high, low, close
+     FROM candles
+     WHERE symbol = ? AND timeframe = ?
+     ORDER BY timestamp ASC
+     LIMIT ?`
+  ).bind(symbol, timeframe, limit).all();
+
+  const candles = (result.results || []).map(c => ({
+    timestamp: Number(c.timestamp),
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close)
+  }));
+
+  if (candles.length < slowLength + 2) {
+    return json({
+      ok: false,
+      error: `Not enough candles. Need at least ${slowLength + 2}, have ${candles.length}.`
+    }, 400);
+  }
+
+  const backtest = runBacktest(candles, {
+    fastLength,
+    slowLength,
+    rsiLength,
+    rsiLong,
+    rsiShort,
+    atrLength,
+    atrMultiplier,
+    rr,
+    initialCapital
+  });
+
+  return json({
+    ok: true,
+    symbol,
+    timeframe,
+    candlesTested: candles.length,
+    settings: {
+      fastLength,
+      slowLength,
+      rsiLength,
+      rsiLong,
+      rsiShort,
+      atrLength,
+      atrMultiplier,
+      rr,
+      initialCapital
+    },
+    result: backtest
+  });
+}
+
 async function handleLiveCandle(request, env) {
   const url = new URL(request.url);
   const symbol = url.searchParams.get("symbol");
@@ -352,10 +568,14 @@ export default {
         return await handleLiveCandle(request, env);
       }
 
+      if (url.pathname === "/backtest" && request.method === "GET") {
+        return await handleBacktest(request, env);
+      }
+
       return json({
         ok: true,
         service: "trading-worker",
-        endpoints: ["/health", "/markets", "/history", "/candles", "/live-candle"]
+        endpoints: ["/health", "/markets", "/history", "/candles", "/live-candle", "/backtest"]
       });
     } catch (error) {
       return json({
