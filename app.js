@@ -254,8 +254,8 @@ function updateLiveCandle(epoch, price) {
 function normaliseCandles(rawCandles) {
   return rawCandles
     .map(candle => ({
-      time: Number(candle.timestamp),
-      timestamp: Number(candle.timestamp),
+      time: Number(candle.timestamp ?? candle.epoch),
+      timestamp: Number(candle.timestamp ?? candle.epoch),
       open: Number(candle.open),
       high: Number(candle.high),
       low: Number(candle.low),
