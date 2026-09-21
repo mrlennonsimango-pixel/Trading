@@ -25,6 +25,7 @@ let lastError = null;
 let lastClose = null;
 let reconnectTimer = null;
 let connectTimeout = null;
+const latestTicks = new Map();
 
 const pending = new Map();
 
@@ -77,6 +78,12 @@ function connectDeriv() {
 
   socket.on("message", routeDerivMessage);
 
+  socket.on("open", () => {
+    for (const symbol of ALLOWED_SYMBOLS) {
+      socket.send(JSON.stringify({ ticks: symbol, subscribe: 1 }));
+    }
+  });
+
   socket.on("error", (error) => {
     clearTimeout(connectTimeout);
     connectTimeout = null;
@@ -114,6 +121,17 @@ function routeDerivMessage(raw) {
       message: "Invalid JSON from Deriv"
     };
     return;
+  }
+
+  if (message.msg_type === "tick" && message.tick) {
+    const symbol = message.tick.symbol;
+    if (symbol && ALLOWED_SYMBOLS.has(symbol)) {
+      latestTicks.set(symbol, {
+        symbol,
+        epoch: Number(message.tick.epoch),
+        quote: Number(message.tick.quote)
+      });
+    }
   }
 
   const reqId = message.req_id;
@@ -156,6 +174,20 @@ app.get("/health", (_req, res) => {
     lastError,
     lastClose
   });
+});
+
+app.get("/live", (req, res) => {
+  const symbol = String(req.query.symbol || "");
+  if (!ALLOWED_SYMBOLS.has(symbol)) {
+    return res.status(400).json({ ok: false, error: "Unsupported symbol" });
+  }
+
+  const tick = latestTicks.get(symbol);
+  if (!tick) {
+    return res.status(503).json({ ok: false, error: "No live tick available", deriv: derivState });
+  }
+
+  return res.json({ ok: true, ...tick });
 });
 
 app.get("/history", (req, res) => {
