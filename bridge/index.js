@@ -3,7 +3,7 @@ import { WebSocket } from "ws";
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
-const DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3";
+const DERIV_WS_URLS = [\n  "wss://api.derivws.com/trading/v1/options/ws/public",\n  "wss://ws.binaryws.com/websockets/v3"\n];\nlet derivEndpointIndex = 0;
 
 const ALLOWED_SYMBOLS = new Set([
   "frxEURUSD",
@@ -40,7 +40,7 @@ function connectDeriv() {
   lastError = null;
   lastClose = null;
 
-  const socket = new WebSocket(DERIV_WS_URL);
+  const endpoint = DERIV_WS_URLS[derivEndpointIndex];\n  console.log("Connecting to Deriv endpoint:", endpoint);\n  const socket = new WebSocket(endpoint);
   derivSocket = socket;
 
   connectTimeout = setTimeout(() => {
@@ -49,8 +49,8 @@ function connectDeriv() {
         name: "ConnectionTimeout",
         message: "Deriv WebSocket did not complete its handshake within 10 seconds"
       };
-      derivState = "timeout";
-      console.error("Deriv WebSocket connection timeout");
+      derivState = "timeout";\n      lastError = {\n        name: "ConnectionTimeout",\n        message: `Deriv WebSocket timeout: ${endpoint}`\n      };
+      console.error("Deriv WebSocket connection timeout:", endpoint);
       socket.terminate();
     }
   }, 10000);
