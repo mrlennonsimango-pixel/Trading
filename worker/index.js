@@ -502,7 +502,7 @@ async function collectMarketData(env) {
     throw new Error("D1 binding DB is not configured");
   }
 
-  // The bridge may sleep on Render's free tier. Wake it first.
+  // Wake the free Render bridge before requesting market data.
   try {
     await fetch(new URL("/health", MARKET_BRIDGE_URL).toString(), {
       cache: "no-store"
@@ -512,108 +512,163 @@ async function collectMarketData(env) {
   const INITIAL_HISTORY = 5000;
   const jobs = [];
 
-  // First run: build a large historical dataset.
-  // Later runs: only collect the newest candles.
   for (const market of MARKETS) {
     for (const timeframe of TIMEFRAMES) {
-      const existing = await env.DB.prepare(
-        `SELECT COUNT(*) AS count
-         FROM candles
-         WHERE symbol = ? AND timeframe = ?`
-      ).bind(market.symbol, timeframe.value).first();
-
-      const existingCount = Number(existing?.count || 0);
-      const count = existingCount < INITIAL_HISTORY
-        ? INITIAL_HISTORY
-        : timeframe.value === 60 ? 10 : 3;
-
       jobs.push({
         symbol: market.symbol,
-        timeframe: timeframe.value,
-        count,
-        backfill: existingCount < INITIAL_HISTORY
+        timeframe: timeframe.value
       });
     }
   }
 
-  async function runJob(job) {
-    let lastError = null;
+  // Process only one job per scheduled run. This keeps the free Render
+  // bridge and the Deriv connection stable while the database is built.
+  const cursorRow = await env.DB.prepare(
+    "SELECT value FROM collector_state WHERE key = 'job_cursor'"
+  ).first();
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+  let cursor = Number(cursorRow?.value || 0);
+  if (!Number.isInteger(cursor) || cursor < 0 || cursor >= jobs.length) cursor = 0;
+
+  const job = jobs[cursor];
+
+  const existing = await env.DB.prepare(
+    `SELECT COUNT(*) AS count
+     FROM candles
+     WHERE symbol = ? AND timeframe = ?`
+  ).bind(job.symbol, job.timeframe).first();
+
+  const existingCount = Number(existing?.count || 0);
+  const backfill = existingCount < INITIAL_HISTORY;
+  const count = backfill
+    ? INITIAL_HISTORY
+    : job.timeframe === 60 ? 10 : 3;
+
+  let lastError = null;
+  let candles = [];
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const bridgeUrl = new URL("/history", MARKET_BRIDGE_URL);
+      bridgeUrl.searchParams.set("symbol", job.symbol);
+      bridgeUrl.searchParams.set("granularity", String(job.timeframe));
+      bridgeUrl.searchParams.set("count", String(count));
+      bridgeUrl.searchParams.set("end", "latest");
+
+      const response = await fetch(bridgeUrl.toString(), {
+        cache: "no-store"
+      });
+
+      let data;
       try {
-        const bridgeUrl = new URL("/history", MARKET_BRIDGE_URL);
-        bridgeUrl.searchParams.set("symbol", job.symbol);
-        bridgeUrl.searchParams.set("granularity", String(job.timeframe));
-        bridgeUrl.searchParams.set("count", String(job.count));
-        bridgeUrl.searchParams.set("end", "latest");
-
-        const response = await fetch(bridgeUrl.toString(), {
-          cache: "no-store"
-        });
-
-        let data;
-        try {
-          data = await response.json();
-        } catch {
-          throw new Error("Invalid bridge response");
-        }
-
-        if (!response.ok || !data.ok) {
-          throw new Error(data.error || "Bridge history request failed");
-        }
-
-        const candles = Array.isArray(data.candles) ? data.candles : [];
-
-        if (candles.length > 0) {
-          await saveCandles(env, job.symbol, job.timeframe, candles);
-        }
-
-        return {
-          symbol: job.symbol,
-          timeframe: job.timeframe,
-          candles: candles.length,
-          backfill: job.backfill,
-          attempt
-        };
-      } catch (error) {
-        lastError = error;
-        if (attempt < 3) {
-          await new Promise(resolve => setTimeout(resolve, 1500 * attempt));
-        }
+        data = await response.json();
+      } catch {
+        throw new Error("Invalid bridge response");
       }
-    }
 
-    throw lastError || new Error("Collection failed");
-  }
+      if (!response.ok || !data.ok) {
+        throw new Error(data.error || "Bridge history request failed");
+      }
 
-  // Limit concurrency so the free Render bridge and Deriv connection
-  // are not hit with all 30 requests at exactly the same time.
-  const successful = [];
-  const failed = [];
+      candles = Array.isArray(data.candles) ? data.candles : [];
+      if (candles.length > 0) {
+        await saveCandles(env, job.symbol, job.timeframe, candles);
+      }
 
-  for (let i = 0; i < jobs.length; i += 5) {
-    const batch = jobs.slice(i, i + 5);
-    const results = await Promise.allSettled(batch.map(runJob));
-
-    for (const result of results) {
-      if (result.status === "fulfilled") {
-        successful.push(result.value);
-      } else {
-        failed.push(result.reason?.message || "Collection failed");
+      lastError = null;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (attempt < 3) {
+        await new Promise(resolve => setTimeout(resolve, 2000 * attempt));
       }
     }
   }
+
+  if (lastError) {
+    console.error(
+      "Scheduled collection failed:",
+      JSON.stringify({
+        symbol: job.symbol,
+        timeframe: job.timeframe,
+        error: lastError.message
+      })
+    );
+
+    // Move forward so one problematic market/timeframe cannot block the
+    // entire database build forever.
+    cursor = (cursor + 1) % jobs.length;
+
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO collector_state (key, value, updated_at)
+       VALUES ('job_cursor', ?, datetime('now'))`
+    ).bind(String(cursor)).run();
+
+    return {
+      jobs: jobs.length,
+      processed: 1,
+      successful: 0,
+      failed: 1,
+      symbol: job.symbol,
+      timeframe: job.timeframe,
+      error: lastError.message,
+      nextCursor: cursor
+    };
+  }
+
+  // If this combination is now fully backfilled, move to the next one.
+  // Otherwise keep the cursor here so another run can retry/fill it.
+  const newCountRow = await env.DB.prepare(
+    `SELECT COUNT(*) AS count
+     FROM candles
+     WHERE symbol = ? AND timeframe = ?`
+  ).bind(job.symbol, job.timeframe).first();
+
+  const newCount = Number(newCountRow?.count || 0);
+  const completed = newCount >= INITIAL_HISTORY || !backfill;
+
+  if (completed) {
+    cursor = (cursor + 1) % jobs.length;
+  }
+
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO collector_state (key, value, updated_at)
+     VALUES ('job_cursor', ?, datetime('now'))`
+  ).bind(String(cursor)).run();
+
+  console.log(
+    "Scheduled market collection:",
+    JSON.stringify({
+      jobs: jobs.length,
+      processed: 1,
+      successful: 1,
+      failed: 0,
+      symbol: job.symbol,
+      timeframe: job.timeframe,
+      requested: count,
+      stored: candles.length,
+      databaseCount: newCount,
+      backfill: backfill,
+      completed,
+      nextCursor: cursor
+    })
+  );
 
   return {
     jobs: jobs.length,
-    successful: successful.length,
-    failed: failed.length,
-    backfills: successful.filter(item => item.backfill).length,
-    stored: successful.reduce((sum, item) => sum + item.candles, 0),
-    errors: failed.slice(0, 10)
+    processed: 1,
+    successful: 1,
+    failed: 0,
+    symbol: job.symbol,
+    timeframe: job.timeframe,
+    requested: count,
+    stored: candles.length,
+    databaseCount: newCount,
+    backfill,
+    completed,
+    nextCursor: cursor
   };
 }
-
 async function handleMarkets() {
   return json({
     ok: true,
