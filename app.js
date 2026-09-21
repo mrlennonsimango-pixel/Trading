@@ -171,7 +171,7 @@ function subscribeLiveTicks(symbol, timeframeSeconds) {
   stopLiveStream();
   liveTimeframeSeconds = Number(timeframeSeconds);
 
-  liveSocket = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
+  liveSocket = new WebSocket("wss://ws.binaryws.com/websockets/v3");
 
   liveSocket.addEventListener("open", () => {
     liveSocket.send(JSON.stringify({
