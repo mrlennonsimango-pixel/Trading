@@ -18,7 +18,9 @@ let derivSocket = null;
 let derivState = "disconnected";
 let lastMessageAt = null;
 let lastError = null;
+let lastClose = null;
 let reconnectTimer = null;
+let connectTimeout = null;
 
 const pending = new Map();
 
@@ -36,20 +38,38 @@ function connectDeriv() {
 
   derivState = "connecting";
   lastError = null;
+  lastClose = null;
 
   const socket = new WebSocket(DERIV_WS_URL);
   derivSocket = socket;
 
+  connectTimeout = setTimeout(() => {
+    if (socket.readyState === WebSocket.CONNECTING) {
+      lastError = {
+        name: "ConnectionTimeout",
+        message: "Deriv WebSocket did not complete its handshake within 10 seconds"
+      };
+      derivState = "timeout";
+      console.error("Deriv WebSocket connection timeout");
+      socket.terminate();
+    }
+  }, 10000);
+
   socket.on("open", () => {
+    clearTimeout(connectTimeout);
+    connectTimeout = null;
     derivState = "connected";
     lastMessageAt = new Date().toISOString();
     lastError = null;
+    lastClose = null;
     console.log("Connected to Deriv WebSocket");
   });
 
   socket.on("message", routeDerivMessage);
 
   socket.on("error", (error) => {
+    clearTimeout(connectTimeout);
+    connectTimeout = null;
     derivState = "error";
     lastError = {
       name: error?.name || "Error",
@@ -59,12 +79,15 @@ function connectDeriv() {
   });
 
   socket.on("close", (code, reason) => {
+    clearTimeout(connectTimeout);
+    connectTimeout = null;
     derivState = "disconnected";
-    if (derivSocket === socket) derivSocket = null;
-    console.error("Deriv WebSocket closed:", {
+    lastClose = {
       code,
       reason: reason?.toString() || ""
-    });
+    };
+    if (derivSocket === socket) derivSocket = null;
+    console.error("Deriv WebSocket closed:", lastClose);
     scheduleReconnect();
   });
 }
@@ -120,7 +143,8 @@ app.get("/health", (_req, res) => {
     service: "trading-market-bridge",
     deriv: derivState,
     lastMessageAt,
-    lastError
+    lastError,
+    lastClose
   });
 });
 
@@ -152,7 +176,8 @@ app.get("/history", (req, res) => {
       ok: false,
       error: "Deriv connection is not ready",
       deriv: derivState,
-      lastError
+      lastError,
+      lastClose
     });
   }
 
@@ -175,7 +200,8 @@ app.get("/history", (req, res) => {
         ok: false,
         error: "Deriv history request timed out",
         deriv: derivState,
-        lastError
+        lastError,
+        lastClose
       });
     }
   }, 15000);
@@ -196,7 +222,8 @@ app.get("/history", (req, res) => {
     return res.status(502).json({
       ok: false,
       error: "Could not send request to Deriv",
-      lastError
+      lastError,
+      lastClose
     });
   }
 });
