@@ -369,7 +369,13 @@ async function handleLiveTick(request) {
   const response = await fetch(`${MARKET_BRIDGE_URL}/live?symbol=${encodeURIComponent(symbol)}`);
   let data;
   try { data = await response.json(); } catch { return json({ ok: false, error: "Market bridge returned an invalid response" }, 502); }
-  return json(data, response.status);
+  return new Response(JSON.stringify(data), {
+    status: response.status,
+    headers: {
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store, no-cache, must-revalidate, max-age=0"
+    }
+  });
 }
 
 async function getHistoricalCandles(symbol, granularity, count, end = "latest") {
