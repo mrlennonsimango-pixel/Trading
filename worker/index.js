@@ -76,6 +76,73 @@ async function getActiveSymbols() {
   });
 }
 
+async function saveSingleCandle(env, symbol, timeframe, candle) {
+  if (!env.DB) return;
+
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO candles
+     (symbol, timeframe, timestamp, open, high, low, close)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  ).bind(
+    symbol,
+    timeframe,
+    Number(candle.time),
+    Number(candle.open),
+    Number(candle.high),
+    Number(candle.low),
+    Number(candle.close)
+  ).run();
+}
+
+async function handleLiveCandle(request, env) {
+  const url = new URL(request.url);
+  const symbol = url.searchParams.get("symbol");
+  const timeframe = Number(url.searchParams.get("timeframe"));
+
+  const validationError = validateMarketAndTimeframe(symbol, timeframe);
+  if (validationError) {
+    return json({ ok: false, error: validationError }, 400);
+  }
+
+  if (!env.DB) {
+    return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  const candle = {
+    time: Number(body.time),
+    open: Number(body.open),
+    high: Number(body.high),
+    low: Number(body.low),
+    close: Number(body.close)
+  };
+
+  if (
+    !Number.isFinite(candle.time) ||
+    !Number.isFinite(candle.open) ||
+    !Number.isFinite(candle.high) ||
+    !Number.isFinite(candle.low) ||
+    !Number.isFinite(candle.close)
+  ) {
+    return json({ ok: false, error: "Invalid candle data" }, 400);
+  }
+
+  await saveSingleCandle(env, symbol, timeframe, candle);
+
+  return json({
+    ok: true,
+    symbol,
+    timeframe,
+    timestamp: candle.time
+  });
+}
+
 async function handleStream(request, env) {
   const url = new URL(request.url);
   const symbol = url.searchParams.get("symbol");
@@ -281,10 +348,14 @@ export default {
         return await handleCandles(request, env);
       }
 
+      if (url.pathname === "/live-candle" && request.method === "POST") {
+        return await handleLiveCandle(request, env);
+      }
+
       return json({
         ok: true,
         service: "trading-worker",
-        endpoints: ["/health", "/markets", "/history", "/candles"]
+        endpoints: ["/health", "/markets", "/history", "/candles", "/live-candle"]
       });
     } catch (error) {
       return json({
