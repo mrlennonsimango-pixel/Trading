@@ -3,8 +3,8 @@ import { WebSocket } from "ws";
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
-
 const DERIV_WS_URL = "wss://ws.binaryws.com/websockets/v3";
+
 const ALLOWED_SYMBOLS = new Set([
   "frxEURUSD",
   "frxXAUUSD",
@@ -17,99 +17,66 @@ const ALLOWED_GRANULARITIES = new Set([60, 300, 900, 3600, 14400, 86400]);
 let derivSocket = null;
 let derivState = "disconnected";
 let lastMessageAt = null;
+let lastError = null;
+let reconnectTimer = null;
+
+const pending = new Map();
+
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectDeriv();
+  }, 3000);
+}
 
 function connectDeriv() {
   if (derivSocket && (derivSocket.readyState === WebSocket.OPEN ||
       derivSocket.readyState === WebSocket.CONNECTING)) return;
 
   derivState = "connecting";
+  lastError = null;
+
   const socket = new WebSocket(DERIV_WS_URL);
   derivSocket = socket;
 
   socket.on("open", () => {
     derivState = "connected";
     lastMessageAt = new Date().toISOString();
+    lastError = null;
+    console.log("Connected to Deriv WebSocket");
   });
 
-  socket.on("message", () => {
-    lastMessageAt = new Date().toISOString();
+  socket.on("message", routeDerivMessage);
+
+  socket.on("error", (error) => {
+    derivState = "error";
+    lastError = {
+      name: error?.name || "Error",
+      message: error?.message || String(error)
+    };
+    console.error("Deriv WebSocket error:", lastError);
   });
 
-  socket.on("close", () => {
+  socket.on("close", (code, reason) => {
     derivState = "disconnected";
     if (derivSocket === socket) derivSocket = null;
-    setTimeout(connectDeriv, 3000);
-  });
-
-  socket.on("error", () => {
-    derivState = "error";
+    console.error("Deriv WebSocket closed:", {
+      code,
+      reason: reason?.toString() || ""
+    });
+    scheduleReconnect();
   });
 }
 
-app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "trading-market-bridge", deriv: derivState });
-});
-
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "trading-market-bridge",
-    deriv: derivState,
-    lastMessageAt
-  });
-});
-
-app.get("/history", (req, res) => {
-  const symbol = String(req.query.symbol || "");
-  const granularity = Number(req.query.granularity || 60);
-  const count = Math.min(Math.max(Number(req.query.count || 500), 1), 5000);
-  const end = req.query.end === "latest" || !req.query.end ? "latest" : Number(req.query.end);
-
-  if (!ALLOWED_SYMBOLS.has(symbol)) {
-    return res.status(400).json({ ok: false, error: "Unsupported symbol" });
-  }
-  if (!ALLOWED_GRANULARITIES.has(granularity)) {
-    return res.status(400).json({ ok: false, error: "Unsupported granularity" });
-  }
-
-  if (!derivSocket || derivSocket.readyState !== WebSocket.OPEN) {
-    connectDeriv();
-    return res.status(503).json({
-      ok: false,
-      error: "Deriv connection is not ready",
-      deriv: derivState
-    });
-  }
-
-  const requestId = Date.now() + Math.floor(Math.random() * 1000);
-
-  const request = {
-    ticks_history: symbol,
-    style: "candles",
-    granularity,
-    count,
-    end,
-    req_id: requestId
-  };
-
-  const timeout = setTimeout(() => {
-    pending.delete(requestId);
-    if (!res.headersSent) {
-      res.status(504).json({ ok: false, error: "Deriv history request timed out" });
-    }
-  }, 15000);
-
-  pending.set(requestId, { res, timeout });
-  derivSocket.send(JSON.stringify(request));
-});
-
-const pending = new Map();
-
 function routeDerivMessage(raw) {
+  lastMessageAt = new Date().toISOString();
+
   let message;
   try {
     message = JSON.parse(raw.toString());
-  } catch {
+  } catch (error) {
+    lastError = { name: error?.name || "ParseError", message: "Invalid JSON from Deriv" };
     return;
   }
 
@@ -136,33 +103,84 @@ function routeDerivMessage(raw) {
   });
 }
 
-const originalConnectDeriv = connectDeriv;
-// Attach the message handler to every new socket by wrapping creation.
-connectDeriv = function wrappedConnectDeriv() {
-  if (derivSocket && (derivSocket.readyState === WebSocket.OPEN ||
-      derivSocket.readyState === WebSocket.CONNECTING)) return;
+app.get("/", (_req, res) => {
+  res.json({ ok: true, service: "trading-market-bridge", deriv: derivState });
+});
 
-  derivState = "connecting";
-  const socket = new WebSocket(DERIV_WS_URL);
-  derivSocket = socket;
-
-  socket.on("open", () => {
-    derivState = "connected";
-    lastMessageAt = new Date().toISOString();
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "trading-market-bridge",
+    deriv: derivState,
+    lastMessageAt,
+    lastError
   });
+});
 
-  socket.on("message", routeDerivMessage);
+app.get("/history", (req, res) => {
+  const symbol = String(req.query.symbol || "");
+  const granularity = Number(req.query.granularity || 60);
+  const count = Math.min(Math.max(Number(req.query.count || 500), 1), 5000);
+  const end = req.query.end === "latest" || !req.query.end ? "latest" : Number(req.query.end);
 
-  socket.on("close", () => {
-    derivState = "disconnected";
-    if (derivSocket === socket) derivSocket = null;
-    setTimeout(connectDeriv, 3000);
-  });
+  if (!ALLOWED_SYMBOLS.has(symbol)) {
+    return res.status(400).json({ ok: false, error: "Unsupported symbol" });
+  }
 
-  socket.on("error", () => {
-    derivState = "error";
-  });
-};
+  if (!ALLOWED_GRANULARITIES.has(granularity)) {
+    return res.status(400).json({ ok: false, error: "Unsupported granularity" });
+  }
+
+  if (!derivSocket || derivSocket.readyState !== WebSocket.OPEN) {
+    connectDeriv();
+    return res.status(503).json({
+      ok: false,
+      error: "Deriv connection is not ready",
+      deriv: derivState,
+      lastError
+    });
+  }
+
+  const requestId = Date.now() + Math.floor(Math.random() * 1000);
+  const request = {
+    ticks_history: symbol,
+    style: "candles",
+    granularity,
+    count,
+    end,
+    req_id: requestId
+  };
+
+  const timeout = setTimeout(() => {
+    pending.delete(requestId);
+    if (!res.headersSent) {
+      res.status(504).json({
+        ok: false,
+        error: "Deriv history request timed out",
+        deriv: derivState,
+        lastError
+      });
+    }
+  }, 15000);
+
+  pending.set(requestId, { res, timeout });
+
+  try {
+    derivSocket.send(JSON.stringify(request));
+  } catch (error) {
+    clearTimeout(timeout);
+    pending.delete(requestId);
+    lastError = {
+      name: error?.name || "SendError",
+      message: error?.message || String(error)
+    };
+    return res.status(502).json({
+      ok: false,
+      error: "Could not send request to Deriv",
+      lastError
+    });
+  }
+}
 
 connectDeriv();
 
