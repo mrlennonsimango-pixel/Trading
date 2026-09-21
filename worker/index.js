@@ -502,6 +502,9 @@ async function collectMarketData(env) {
     throw new Error("D1 binding DB is not configured");
   }
 
+  // Keep the backfill cursor in D1 so each cron run can resume safely.
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS collector_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')))").run();
+
   // Wake the free Render bridge before requesting market data.
   try {
     await fetch(new URL("/health", MARKET_BRIDGE_URL).toString(), {
