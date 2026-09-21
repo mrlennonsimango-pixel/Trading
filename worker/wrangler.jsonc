@@ -2,5 +2,12 @@
   "$schema": "https://unpkg.com/wrangler@latest/config-schema.json",
   "name": "trading-api-worker",
   "main": "index.js",
-  "compatibility_date": "2026-09-21"
+  "compatibility_date": "2026-09-21",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "trading-market-data",
+      "database_id": "9848c75d-9435-4bd3-bc08-7560c4f60f01"
+    }
+  ]
 }
