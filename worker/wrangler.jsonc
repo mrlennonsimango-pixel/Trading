@@ -3,6 +3,9 @@
   "name": "trading-api-worker",
   "main": "index.js",
   "compatibility_date": "2026-09-21",
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
   "d1_databases": [
     {
       "binding": "DB",
