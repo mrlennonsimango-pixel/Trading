@@ -1,4 +1,5 @@
 const DERIV_WS = "wss://ws.binaryws.com/websockets/v3";
+const MARKET_BRIDGE_URL = "https://trading-market-bridge.onrender.com";
 
 const MARKETS = [
   { symbol: "frxEURUSD", name: "EUR/USD", category: "Forex" },
@@ -528,17 +529,42 @@ async function handleHistory(request, env) {
     return json({ ok: false, error: validationError }, 400);
   }
 
-  if (!env.DB) {
-    return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
+  const bridgeUrl = new URL("/history", MARKET_BRIDGE_URL);
+  bridgeUrl.searchParams.set("symbol", symbol);
+  bridgeUrl.searchParams.set("granularity", String(timeframe));
+  bridgeUrl.searchParams.set("count", String(count));
+  bridgeUrl.searchParams.set("end", end);
+
+  const bridgeResponse = await fetch(bridgeUrl.toString());
+
+  let bridgeData;
+  try {
+    bridgeData = await bridgeResponse.json();
+  } catch {
+    return json({ ok: false, error: "Market bridge returned an invalid response" }, 502);
+  }
+
+  if (!bridgeResponse.ok || !bridgeData.ok) {
+    return json({
+      ok: false,
+      error: bridgeData.error || "Market bridge request failed",
+      bridgeStatus: bridgeResponse.status,
+      deriv: bridgeData.deriv || null
+    }, 502);
+  }
+
+  const candles = Array.isArray(bridgeData.candles) ? bridgeData.candles : [];
+
+  if (env.DB && candles.length > 0) {
+    await saveCandles(env, symbol, timeframe, candles);
   }
 
   return json({
     ok: true,
     symbol,
     timeframe,
-    count: 0,
-    candles: [],
-    message: "Historical candles are fetched directly from Deriv by the browser and stored through /store-candles."
+    count: candles.length,
+    candles
   });
 }
 
