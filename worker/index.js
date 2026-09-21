@@ -34,7 +34,7 @@ function wsRequest(symbol, granularity, count) {
   });
 }
 
-async function getHistoricalCandles(symbol, granularity, count) {
+async function getHistoricalCandles(symbol, granularity, count, end = "latest") {
   const socket = new WebSocket(DERIV_WS);
 
   return await new Promise((resolve, reject) => {
@@ -48,7 +48,13 @@ async function getHistoricalCandles(symbol, granularity, count) {
     };
 
     socket.addEventListener("open", () => {
-      socket.send(wsRequest(symbol, granularity, count));
+      socket.send(JSON.stringify({
+        ticks_history: symbol,
+        style: "candles",
+        granularity,
+        count,
+        end
+      }));
     });
 
     socket.addEventListener("message", event => {
@@ -123,6 +129,12 @@ async function handleHistory(request, env) {
     Math.max(Number(url.searchParams.get("count") || 500), 1),
     5000
   );
+  const endParam = url.searchParams.get("end") || "latest";
+  const end = endParam === "latest" ? "latest" : Number(endParam);
+
+  if (end !== "latest" && (!Number.isFinite(end) || end <= 0)) {
+    return json({ ok: false, error: "Invalid end timestamp" }, 400);
+  }
 
   const validationError = validateMarketAndTimeframe(symbol, timeframe);
   if (validationError) {
@@ -133,7 +145,7 @@ async function handleHistory(request, env) {
     return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
   }
 
-  const candles = await getHistoricalCandles(symbol, timeframe, count);
+  const candles = await getHistoricalCandles(symbol, timeframe, count, end);
   await saveCandles(env, symbol, timeframe, candles);
 
   return json({
