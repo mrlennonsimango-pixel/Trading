@@ -135,15 +135,9 @@ button:disabled {
 }
 
 .chart-area {
+  height: 470px;
   min-height: 470px;
-  display: grid;
-  place-items: center;
-}
-
-.empty-state {
-  color: #6f7c89;
-  text-align: center;
-  padding: 30px;
+  width: 100%;
 }
 
 @media (max-width: 700px) {
