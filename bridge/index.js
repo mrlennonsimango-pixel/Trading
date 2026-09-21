@@ -76,7 +76,10 @@ function routeDerivMessage(raw) {
   try {
     message = JSON.parse(raw.toString());
   } catch (error) {
-    lastError = { name: error?.name || "ParseError", message: "Invalid JSON from Deriv" };
+    lastError = {
+      name: error?.name || "ParseError",
+      message: "Invalid JSON from Deriv"
+    };
     return;
   }
 
@@ -104,7 +107,11 @@ function routeDerivMessage(raw) {
 }
 
 app.get("/", (_req, res) => {
-  res.json({ ok: true, service: "trading-market-bridge", deriv: derivState });
+  res.json({
+    ok: true,
+    service: "trading-market-bridge",
+    deriv: derivState
+  });
 });
 
 app.get("/health", (_req, res) => {
@@ -121,14 +128,22 @@ app.get("/history", (req, res) => {
   const symbol = String(req.query.symbol || "");
   const granularity = Number(req.query.granularity || 60);
   const count = Math.min(Math.max(Number(req.query.count || 500), 1), 5000);
-  const end = req.query.end === "latest" || !req.query.end ? "latest" : Number(req.query.end);
+  const end = req.query.end === "latest" || !req.query.end
+    ? "latest"
+    : Number(req.query.end);
 
   if (!ALLOWED_SYMBOLS.has(symbol)) {
-    return res.status(400).json({ ok: false, error: "Unsupported symbol" });
+    return res.status(400).json({
+      ok: false,
+      error: "Unsupported symbol"
+    });
   }
 
   if (!ALLOWED_GRANULARITIES.has(granularity)) {
-    return res.status(400).json({ ok: false, error: "Unsupported granularity" });
+    return res.status(400).json({
+      ok: false,
+      error: "Unsupported granularity"
+    });
   }
 
   if (!derivSocket || derivSocket.readyState !== WebSocket.OPEN) {
@@ -142,6 +157,7 @@ app.get("/history", (req, res) => {
   }
 
   const requestId = Date.now() + Math.floor(Math.random() * 1000);
+
   const request = {
     ticks_history: symbol,
     style: "candles",
@@ -153,6 +169,7 @@ app.get("/history", (req, res) => {
 
   const timeout = setTimeout(() => {
     pending.delete(requestId);
+
     if (!res.headersSent) {
       res.status(504).json({
         ok: false,
@@ -170,17 +187,19 @@ app.get("/history", (req, res) => {
   } catch (error) {
     clearTimeout(timeout);
     pending.delete(requestId);
+
     lastError = {
       name: error?.name || "SendError",
       message: error?.message || String(error)
     };
+
     return res.status(502).json({
       ok: false,
       error: "Could not send request to Deriv",
       lastError
     });
   }
-}
+});
 
 connectDeriv();
 
