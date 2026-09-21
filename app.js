@@ -21,6 +21,8 @@ let loadingOlder = false;
 let liveSocket = null;
 let liveCandle = null;
 let liveTimeframeSeconds = 60;
+let lastPersistedCandleTime = null;
+let persistTimer = null;
 
 const INITIAL_CANDLES = 500;
 const OLDER_CANDLES = 500;
@@ -110,11 +112,49 @@ function createChart() {
 }
 
 function stopLiveStream() {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+
   if (liveSocket) {
     try { liveSocket.close(); } catch {}
     liveSocket = null;
   }
   liveCandle = null;
+  lastPersistedCandleTime = null;
+}
+
+function persistLiveCandle() {
+  if (!liveCandle) return;
+
+  const market = selectedMarketObject();
+  const timeframe = selectedTimeframeObject();
+  if (!market || !timeframe) return;
+
+  const candle = { ...liveCandle };
+  const url = `/api/live-candle?symbol=${encodeURIComponent(market.symbol)}&timeframe=${timeframe.value}`;
+
+  fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(candle),
+    keepalive: true
+  }).catch(() => {});
+
+  lastPersistedCandleTime = candle.time;
+}
+
+function scheduleLivePersistence() {
+  if (persistTimer) return;
+
+  // Persist periodically while the current candle is forming.
+  // The completed candle is also persisted immediately when the bucket changes.
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    persistLiveCandle();
+    if (liveCandle) scheduleLivePersistence();
+  }, 10000);
 }
 
 function subscribeLiveTicks(symbol, timeframeSeconds) {
@@ -169,6 +209,8 @@ function updateLiveCandle(epoch, price) {
   const bucket = Math.floor(epoch / liveTimeframeSeconds) * liveTimeframeSeconds;
 
   if (!liveCandle || liveCandle.time !== bucket) {
+    if (liveCandle) persistLiveCandle();
+
     liveCandle = {
       time: bucket,
       open: price,
@@ -191,6 +233,10 @@ function updateLiveCandle(epoch, price) {
     low: liveCandle.low,
     close: liveCandle.close
   });
+
+  // Keep D1 synchronized while the live candle forms.
+  // A 10-second cadence avoids writing on every tick.
+  scheduleLivePersistence();
 
   candleCount.textContent = candles.length;
 }
@@ -277,6 +323,7 @@ async function loadMarketData() {
     dataStatus.textContent = `Loaded ${candles.length} candles. Live stream starting...`;
     setStatus("Connected", true);
     subscribeLiveTicks(market.symbol, timeframe.value);
+    persistLiveCandle();
   } catch (error) {
     candles = [];
     candleCount.textContent = "—";
