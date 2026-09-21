@@ -32,6 +32,8 @@ let liveSocket = null;
 let liveCandle = null;
 let liveTimeframeSeconds = 60;
 let livePollTimer = null;
+let livePollInFlight = false;
+let livePollGeneration = 0;
 let lastPersistedCandleTime = null;
 let persistTimer = null;
 
@@ -123,6 +125,9 @@ function createChart() {
 }
 
 function stopLiveStream() {
+  livePollGeneration += 1;
+  livePollInFlight = false;
+
   if (persistTimer) {
     clearTimeout(persistTimer);
     persistTimer = null;
@@ -132,7 +137,7 @@ function stopLiveStream() {
     liveSocket = null;
   }
   if (livePollTimer) {
-    clearInterval(livePollTimer);
+    clearTimeout(livePollTimer);
     livePollTimer = null;
   }
   liveCandle = null;
@@ -144,10 +149,15 @@ function persistLiveCandle() {
   const market = selectedMarketObject();
   const timeframe = selectedTimeframeObject();
   if (!market || !timeframe) return;
+
   const candle = { ...liveCandle };
   fetch(`/api/live-candle?symbol=${encodeURIComponent(market.symbol)}&timeframe=${timeframe.value}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(candle), keepalive: true
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(candle),
+    keepalive: true
   }).catch(() => {});
+
   lastPersistedCandleTime = candle.time;
 }
 
@@ -163,18 +173,50 @@ function scheduleLivePersistence() {
 function subscribeLiveTicks(symbol, timeframeSeconds) {
   stopLiveStream();
   liveTimeframeSeconds = Number(timeframeSeconds);
+
+  const generation = livePollGeneration;
+
   const poll = async () => {
+    if (generation !== livePollGeneration || livePollInFlight) return;
+
+    livePollInFlight = true;
     try {
-      const response = await fetch(`/api/live-tick?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+      const response = await fetch(
+        `/api/live-tick?symbol=${encodeURIComponent(symbol)}&_t=${Date.now()}`,
+        {
+          cache: "no-store",
+          headers: { "Cache-Control": "no-cache" }
+        }
+      );
+
       const data = await response.json();
-      if (!response.ok || !data.ok) return;
+
+      if (generation !== livePollGeneration) return;
+
+      if (!response.ok || !data.ok) {
+        dataStatus.textContent = "Waiting for live market data...";
+        setStatus("Connecting", false);
+        return;
+      }
+
       updateLiveCandle(Number(data.epoch), Number(data.quote));
       dataStatus.textContent = "Live market data connected through bridge.";
       setStatus("Live", true);
-    } catch {}
+    } catch {
+      if (generation === livePollGeneration) {
+        dataStatus.textContent = "Reconnecting to live market data...";
+        setStatus("Reconnecting", false);
+      }
+    } finally {
+      livePollInFlight = false;
+
+      if (generation === livePollGeneration) {
+        livePollTimer = setTimeout(poll, 1000);
+      }
+    }
   };
+
   poll();
-  livePollTimer = setInterval(poll, 2000);
 }
 
 function updateLiveCandle(epoch, price) {
