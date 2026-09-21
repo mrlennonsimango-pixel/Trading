@@ -1,6 +1,7 @@
 const marketSelect = document.getElementById("market");
 const timeframeSelect = document.getElementById("timeframe");
 const loadButton = document.getElementById("loadButton");
+const loadOlderButton = document.getElementById("loadOlderButton");
 const statusText = document.getElementById("statusText");
 const statusDot = document.getElementById("statusDot");
 const selectedMarket = document.getElementById("selectedMarket");
@@ -15,6 +16,11 @@ let timeframes = [];
 let chart = null;
 let candleSeries = null;
 let resizeObserver = null;
+let candles = [];
+let loadingOlder = false;
+
+const INITIAL_CANDLES = 500;
+const OLDER_CANDLES = 500;
 
 function setStatus(text, online = true) {
   statusText.textContent = text;
@@ -52,11 +58,7 @@ function selectedTimeframeObject() {
 }
 
 function createChart() {
-  if (chart) {
-    chart.remove();
-    chart = null;
-    candleSeries = null;
-  }
+  if (chart) chart.remove();
 
   chart = LightweightCharts.createChart(chartArea, {
     width: chartArea.clientWidth,
@@ -69,9 +71,7 @@ function createChart() {
       vertLines: { color: "#1b232c" },
       horzLines: { color: "#1b232c" }
     },
-    rightPriceScale: {
-      borderColor: "#303944"
-    },
+    rightPriceScale: { borderColor: "#303944" },
     timeScale: {
       borderColor: "#303944",
       timeVisible: true,
@@ -90,6 +90,7 @@ function createChart() {
     wickDownColor: "#e05252"
   });
 
+  resizeObserver?.disconnect();
   resizeObserver = new ResizeObserver(() => {
     if (!chart) return;
     chart.applyOptions({
@@ -97,16 +98,19 @@ function createChart() {
       height: Math.max(chartArea.clientHeight, 470)
     });
   });
-
   resizeObserver.observe(chartArea);
+
+  chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (!range || range.from > 25 || loadingOlder || candles.length === 0) return;
+    loadOlderHistory();
+  });
 }
 
-function renderCandles(candles) {
-  if (!candleSeries) createChart();
-
-  const data = candles
+function normaliseCandles(rawCandles) {
+  return rawCandles
     .map(candle => ({
       time: Number(candle.timestamp),
+      timestamp: Number(candle.timestamp),
       open: Number(candle.open),
       high: Number(candle.high),
       low: Number(candle.low),
@@ -120,15 +124,54 @@ function renderCandles(candles) {
       Number.isFinite(candle.close)
     )
     .sort((a, b) => a.time - b.time);
+}
 
-  candleSeries.setData(data);
-  chart.timeScale().fitContent();
+function renderCandles(preservePosition = false, oldRange = null) {
+  if (!candleSeries) createChart();
+
+  candleSeries.setData(candles.map(candle => ({
+    time: candle.time,
+    open: candle.open,
+    high: candle.high,
+    low: candle.low,
+    close: candle.close
+  })));
+
+  if (preservePosition && oldRange) {
+    chart.timeScale().setVisibleLogicalRange({
+      from: oldRange.from + (candles.length - oldRange.previousLength),
+      to: oldRange.to + (candles.length - oldRange.previousLength)
+    });
+  } else {
+    chart.timeScale().fitContent();
+  }
+}
+
+async function requestHistory(end, count) {
+  const market = selectedMarketObject();
+  const timeframe = selectedTimeframeObject();
+
+  const params = new URLSearchParams({
+    symbol: market.symbol,
+    timeframe: timeframe.value,
+    count: String(count)
+  });
+
+  if (end !== "latest") params.set("end", String(end));
+
+  const response = await fetch(`/api/history?${params}`);
+  const data = await response.json();
+
+  if (!response.ok || !data.ok) {
+    throw new Error(data.error || "Market data request failed");
+  }
+
+  return normaliseCandles(data.candles || []);
 }
 
 async function loadMarketData() {
   const market = selectedMarketObject();
   const timeframe = selectedTimeframeObject();
-
   if (!market || !timeframe) return;
 
   selectedMarket.textContent = market.name;
@@ -136,27 +179,65 @@ async function loadMarketData() {
   chartTitle.textContent = `${market.name} · ${timeframe.label}`;
   dataStatus.textContent = "Loading historical data...";
   loadButton.disabled = true;
+  loadOlderButton.disabled = true;
 
   try {
-    const response = await fetch(
-      `/api/history?symbol=${encodeURIComponent(market.symbol)}&timeframe=${timeframe.value}&count=500`
-    );
-    const data = await response.json();
-
-    if (!response.ok || !data.ok) {
-      throw new Error(data.error || "Market data request failed");
-    }
-
-    renderCandles(data.candles || []);
-    candleCount.textContent = data.count;
-    dataStatus.textContent = `Loaded ${data.count} candles.`;
+    candles = await requestHistory("latest", INITIAL_CANDLES);
+    renderCandles();
+    candleCount.textContent = candles.length;
+    dataStatus.textContent = `Loaded ${candles.length} candles. Scroll left to load older history.`;
     setStatus("Connected", true);
   } catch (error) {
+    candles = [];
     candleCount.textContent = "—";
     dataStatus.textContent = error.message;
     setStatus("Data error", false);
   } finally {
     loadButton.disabled = false;
+    loadOlderButton.disabled = false;
+  }
+}
+
+async function loadOlderHistory() {
+  if (loadingOlder || candles.length === 0) return;
+
+  const market = selectedMarketObject();
+  const timeframe = selectedTimeframeObject();
+  if (!market || !timeframe) return;
+
+  loadingOlder = true;
+  loadOlderButton.disabled = true;
+  dataStatus.textContent = "Loading older history...";
+
+  const oldest = candles[0].timestamp;
+  const previousLength = candles.length;
+  const range = chart.timeScale().getVisibleLogicalRange();
+
+  try {
+    const older = await requestHistory(oldest - 1, OLDER_CANDLES);
+
+    if (older.length === 0) {
+      dataStatus.textContent = "No older candles are available.";
+      return;
+    }
+
+    const merged = new Map(candles.map(candle => [candle.timestamp, candle]));
+    for (const candle of older) merged.set(candle.timestamp, candle);
+
+    candles = Array.from(merged.values()).sort((a, b) => a.timestamp - b.timestamp);
+    renderCandles(true, {
+      from: range?.from ?? 0,
+      to: range?.to ?? previousLength,
+      previousLength
+    });
+
+    candleCount.textContent = candles.length;
+    dataStatus.textContent = `Loaded ${older.length} older candles · ${candles.length} total.`;
+  } catch (error) {
+    dataStatus.textContent = error.message;
+  } finally {
+    loadingOlder = false;
+    loadOlderButton.disabled = false;
   }
 }
 
@@ -187,5 +268,6 @@ async function initialise() {
 marketSelect.addEventListener("change", loadMarketData);
 timeframeSelect.addEventListener("change", loadMarketData);
 loadButton.addEventListener("click", loadMarketData);
+loadOlderButton.addEventListener("click", loadOlderHistory);
 
 initialise();
