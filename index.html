@@ -46,6 +46,26 @@
       </div>
     </section>
 
+    <section class="backtest-panel">
+      <div class="panel-header">
+        <strong>Backtest</strong>
+        <span id="backtestStatus">Uses candles stored in D1.</span>
+      </div>
+      <div class="backtest-controls">
+        <label>Fast MA <input id="fastLength" type="number" value="20" min="2"></label>
+        <label>Slow MA <input id="slowLength" type="number" value="50" min="3"></label>
+        <label>RSI <input id="rsiLength" type="number" value="14" min="2"></label>
+        <label>RR <input id="rr" type="number" value="3" min="0.1" step="0.1"></label>
+        <button id="backtestButton">Run Backtest</button>
+      </div>
+      <div class="backtest-results">
+        <div><span class="label">Trades</span><strong id="btTrades">—</strong></div>
+        <div><span class="label">Win rate</span><strong id="btWinRate">—</strong></div>
+        <div><span class="label">Net P/L</span><strong id="btPnl">—</strong></div>
+        <div><span class="label">Final equity</span><strong id="btEquity">—</strong></div>
+      </div>
+    </section>
+
     <section class="chart-panel">
       <div class="panel-header">
         <strong id="chartTitle">Market Chart</strong>
