@@ -18,6 +18,9 @@ let candleSeries = null;
 let resizeObserver = null;
 let candles = [];
 let loadingOlder = false;
+let liveSocket = null;
+let liveCandle = null;
+let liveTimeframeSeconds = 60;
 
 const INITIAL_CANDLES = 500;
 const OLDER_CANDLES = 500;
@@ -106,6 +109,92 @@ function createChart() {
   });
 }
 
+function stopLiveStream() {
+  if (liveSocket) {
+    try { liveSocket.close(); } catch {}
+    liveSocket = null;
+  }
+  liveCandle = null;
+}
+
+function subscribeLiveTicks(symbol, timeframeSeconds) {
+  stopLiveStream();
+  liveTimeframeSeconds = Number(timeframeSeconds);
+
+  liveSocket = new WebSocket("wss://ws.derivws.com/websockets/v3?app_id=1089");
+
+  liveSocket.addEventListener("open", () => {
+    liveSocket.send(JSON.stringify({
+      ticks: symbol,
+      subscribe: 1
+    }));
+    dataStatus.textContent = "Live market data connected.";
+    setStatus("Live", true);
+  });
+
+  liveSocket.addEventListener("message", event => {
+    try {
+      const message = JSON.parse(event.data);
+
+      if (message.error) {
+        dataStatus.textContent = message.error.message || "Live data error";
+        return;
+      }
+
+      if (message.msg_type !== "tick" || !message.tick) return;
+
+      updateLiveCandle(
+        Number(message.tick.epoch),
+        Number(message.tick.quote)
+      );
+    } catch {}
+  });
+
+  liveSocket.addEventListener("error", () => {
+    dataStatus.textContent = "Live data connection error.";
+    setStatus("Live error", false);
+  });
+
+  liveSocket.addEventListener("close", () => {
+    if (liveSocket) {
+      dataStatus.textContent = "Live data disconnected. Reloading market data will reconnect.";
+      setStatus("Disconnected", false);
+    }
+  });
+}
+
+function updateLiveCandle(epoch, price) {
+  if (!Number.isFinite(epoch) || !Number.isFinite(price) || !candleSeries) return;
+
+  const bucket = Math.floor(epoch / liveTimeframeSeconds) * liveTimeframeSeconds;
+
+  if (!liveCandle || liveCandle.time !== bucket) {
+    liveCandle = {
+      time: bucket,
+      open: price,
+      high: price,
+      low: price,
+      close: price
+    };
+
+    candles.push(liveCandle);
+  } else {
+    liveCandle.high = Math.max(liveCandle.high, price);
+    liveCandle.low = Math.min(liveCandle.low, price);
+    liveCandle.close = price;
+  }
+
+  candleSeries.update({
+    time: liveCandle.time,
+    open: liveCandle.open,
+    high: liveCandle.high,
+    low: liveCandle.low,
+    close: liveCandle.close
+  });
+
+  candleCount.textContent = candles.length;
+}
+
 function normaliseCandles(rawCandles) {
   return rawCandles
     .map(candle => ({
@@ -185,8 +274,9 @@ async function loadMarketData() {
     candles = await requestHistory("latest", INITIAL_CANDLES);
     renderCandles();
     candleCount.textContent = candles.length;
-    dataStatus.textContent = `Loaded ${candles.length} candles. Scroll left to load older history.`;
+    dataStatus.textContent = `Loaded ${candles.length} candles. Live stream starting...`;
     setStatus("Connected", true);
+    subscribeLiveTicks(market.symbol, timeframe.value);
   } catch (error) {
     candles = [];
     candleCount.textContent = "—";
@@ -266,7 +356,10 @@ async function initialise() {
 }
 
 marketSelect.addEventListener("change", loadMarketData);
-timeframeSelect.addEventListener("change", loadMarketData);
+timeframeSelect.addEventListener("change", () => {
+  stopLiveStream();
+  loadMarketData();
+});
 loadButton.addEventListener("click", loadMarketData);
 loadOlderButton.addEventListener("click", loadOlderHistory);
 
