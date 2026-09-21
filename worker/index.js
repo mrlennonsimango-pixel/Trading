@@ -1,15 +1,30 @@
 const DERIV_WS = "wss://ws.derivws.com/websockets/v3?app_id=1089";
 
-const ALLOWED_SYMBOLS = new Set([
-  "1HZ10V","1HZ15V","1HZ25V","1HZ30V","1HZ50V",
-  "1HZ75V","1HZ90V","1HZ100V"
-]);
+const MARKETS = [
+  { symbol: "frxEURUSD", name: "EUR/USD", category: "Forex" },
+  { symbol: "frxXAUUSD", name: "Gold/USD", category: "Commodities" },
+  { symbol: "1HZ50V", name: "Volatility 50", category: "Synthetic" },
+  { symbol: "1HZ75V", name: "Volatility 75", category: "Synthetic" },
+  { symbol: "BOOM1000", name: "Boom 1000 Index", category: "Synthetic" }
+];
+
+const TIMEFRAMES = [
+  { value: 60, label: "1M" },
+  { value: 300, label: "5M" },
+  { value: 900, label: "15M" },
+  { value: 3600, label: "1H" },
+  { value: 14400, label: "4H" },
+  { value: 86400, label: "1D" }
+];
+
+const ALLOWED_SYMBOLS = new Set(MARKETS.map(market => market.symbol));
+const ALLOWED_TIMEFRAMES = new Set(TIMEFRAMES.map(timeframe => timeframe.value));
 
 function json(data, status = 200) {
   return Response.json(data, { status });
 }
 
-function wsRequest(symbol, granularity, count = 500) {
+function wsRequest(symbol, granularity, count) {
   return JSON.stringify({
     ticks_history: symbol,
     style: "candles",
@@ -39,8 +54,14 @@ async function getHistoricalCandles(symbol, granularity, count) {
     socket.addEventListener("message", event => {
       try {
         const message = JSON.parse(event.data);
-        if (message.error) return finish(reject, new Error(message.error.message));
-        if (message.candles) return finish(resolve, message.candles);
+
+        if (message.error) {
+          return finish(reject, new Error(message.error.message));
+        }
+
+        if (message.candles) {
+          return finish(resolve, message.candles);
+        }
       } catch (error) {
         finish(reject, error);
       }
@@ -50,6 +71,18 @@ async function getHistoricalCandles(symbol, granularity, count) {
       finish(reject, new Error("Deriv WebSocket connection failed"));
     });
   });
+}
+
+function validateMarketAndTimeframe(symbol, timeframe) {
+  if (!ALLOWED_SYMBOLS.has(symbol)) {
+    return "Unsupported market";
+  }
+
+  if (!ALLOWED_TIMEFRAMES.has(timeframe)) {
+    return "Unsupported timeframe";
+  }
+
+  return null;
 }
 
 async function saveCandles(env, symbol, timeframe, candles) {
@@ -74,19 +107,30 @@ async function saveCandles(env, symbol, timeframe, candles) {
   }
 }
 
+async function handleMarkets() {
+  return json({
+    ok: true,
+    markets: MARKETS,
+    timeframes: TIMEFRAMES
+  });
+}
+
 async function handleHistory(request, env) {
   const url = new URL(request.url);
-  const symbol = url.searchParams.get("symbol") || "1HZ50V";
-  const timeframe = Number(url.searchParams.get("timeframe") || 60);
-  const count = Math.min(Number(url.searchParams.get("count") || 500), 5000);
+  const symbol = url.searchParams.get("symbol");
+  const timeframe = Number(url.searchParams.get("timeframe"));
+  const count = Math.min(
+    Math.max(Number(url.searchParams.get("count") || 500), 1),
+    5000
+  );
 
-  if (!ALLOWED_SYMBOLS.has(symbol)) {
-    return json({ ok: false, error: "Unsupported volatility symbol" }, 400);
+  const validationError = validateMarketAndTimeframe(symbol, timeframe);
+  if (validationError) {
+    return json({ ok: false, error: validationError }, 400);
   }
 
-  const allowedTimeframes = new Set([60, 300, 900, 3600, 14400, 86400]);
-  if (!allowedTimeframes.has(timeframe)) {
-    return json({ ok: false, error: "Unsupported timeframe" }, 400);
+  if (!env.DB) {
+    return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
   }
 
   const candles = await getHistoricalCandles(symbol, timeframe, count);
@@ -103,12 +147,20 @@ async function handleHistory(request, env) {
 
 async function handleCandles(request, env) {
   const url = new URL(request.url);
-  const symbol = url.searchParams.get("symbol") || "1HZ50V";
-  const timeframe = Number(url.searchParams.get("timeframe") || 60);
-  const limit = Math.min(Number(url.searchParams.get("limit") || 500), 5000);
+  const symbol = url.searchParams.get("symbol");
+  const timeframe = Number(url.searchParams.get("timeframe"));
+  const limit = Math.min(
+    Math.max(Number(url.searchParams.get("limit") || 500), 1),
+    5000
+  );
 
-  if (!ALLOWED_SYMBOLS.has(symbol)) {
-    return json({ ok: false, error: "Unsupported volatility symbol" }, 400);
+  const validationError = validateMarketAndTimeframe(symbol, timeframe);
+  if (validationError) {
+    return json({ ok: false, error: validationError }, 400);
+  }
+
+  if (!env.DB) {
+    return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
   }
 
   const result = await env.DB.prepare(
@@ -141,6 +193,10 @@ export default {
         });
       }
 
+      if (url.pathname === "/markets" && request.method === "GET") {
+        return await handleMarkets();
+      }
+
       if (url.pathname === "/history" && request.method === "GET") {
         return await handleHistory(request, env);
       }
@@ -152,7 +208,7 @@ export default {
       return json({
         ok: true,
         service: "trading-worker",
-        endpoints: ["/health", "/history", "/candles"]
+        endpoints: ["/health", "/markets", "/history", "/candles"]
       });
     } catch (error) {
       return json({
