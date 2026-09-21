@@ -298,67 +298,33 @@ async function requestHistory(end, count) {
 
   if (!market || !timeframe) throw new Error("Market or timeframe not selected");
 
-  const socket = new WebSocket("wss://ws.binaryws.com/websockets/v3");
-  const request = {
-    ticks_history: market.symbol,
-    style: "candles",
-    granularity: Number(timeframe.value),
-    count: Number(count),
-    end: end === "latest" ? "latest" : Number(end)
-  };
-
-  return await new Promise((resolve, reject) => {
-    let settled = false;
-
-    const finish = (fn, value) => {
-      if (settled) return;
-      settled = true;
-      try { socket.close(); } catch {}
-      fn(value);
-    };
-
-    socket.addEventListener("open", () => {
-      socket.send(JSON.stringify(request));
-    });
-
-    socket.addEventListener("message", async event => {
-      try {
-        const message = JSON.parse(event.data);
-
-        if (message.error) {
-          return finish(reject, new Error(message.error.message || "Deriv market-data error"));
-        }
-
-        if (!message.candles) return;
-
-        const result = normaliseCandles(message.candles);
-
-        // Persist the same candles into D1 through the Cloudflare Worker.
-        fetch("/api/store-candles", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            symbol: market.symbol,
-            timeframe: Number(timeframe.value),
-            candles: result
-          }),
-          keepalive: true
-        }).catch(() => {});
-
-        finish(resolve, result);
-      } catch (error) {
-        finish(reject, error);
-      }
-    });
-
-    socket.addEventListener("error", () => {
-      finish(reject, new Error("Deriv WebSocket connection failed"));
-    });
-
-    socket.addEventListener("close", () => {
-      if (!settled) finish(reject, new Error("Deriv WebSocket connection closed before data arrived"));
-    });
+  const params = new URLSearchParams({
+    symbol: market.symbol,
+    timeframe: String(timeframe.value),
+    count: String(count),
+    end: end === "latest" ? "latest" : String(end)
   });
+
+  const response = await fetch(`/api/history?${params.toString()}`);
+  let data;
+
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error("Trading API returned an invalid response");
+  }
+
+  if (!response.ok || !data.ok) {
+    throw new Error(data.error || "Could not load historical market data");
+  }
+
+  const result = normaliseCandles(data.candles || []);
+
+  if (result.length === 0) {
+    throw new Error("No historical candles were returned");
+  }
+
+  return result;
 }
 
 async function runBacktest() {
