@@ -34,19 +34,6 @@ function wsRequest(symbol, granularity, count) {
   });
 }
 
-async function connectDerivWebSocket() {
-  const response = await fetch(DERIV_WS.replace("wss://", "https://"), {
-    headers: { Upgrade: "websocket" }
-  });
-
-  if (!response.webSocket) {
-    throw new Error("Deriv WebSocket handshake was not accepted");
-  }
-
-  response.webSocket.accept();
-  return response.webSocket;
-}
-
 async function getActiveSymbols() {
   const socket = await connectDerivWebSocket();
 
@@ -473,6 +460,46 @@ async function saveCandles(env, symbol, timeframe, candles) {
   }
 }
 
+async function handleStoreCandles(request, env) {
+  if (!env.DB) {
+    return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ ok: false, error: "Invalid JSON body" }, 400);
+  }
+
+  const symbol = body.symbol;
+  const timeframe = Number(body.timeframe);
+  const validationError = validateMarketAndTimeframe(symbol, timeframe);
+  if (validationError) return json({ ok: false, error: validationError }, 400);
+
+  if (!Array.isArray(body.candles) || body.candles.length === 0) {
+    return json({ ok: false, error: "No candles supplied" }, 400);
+  }
+
+  const candles = body.candles.map(c => ({
+    epoch: Number(c.time ?? c.epoch),
+    open: Number(c.open),
+    high: Number(c.high),
+    low: Number(c.low),
+    close: Number(c.close)
+  })).filter(c =>
+    Number.isFinite(c.epoch) &&
+    Number.isFinite(c.open) &&
+    Number.isFinite(c.high) &&
+    Number.isFinite(c.low) &&
+    Number.isFinite(c.close)
+  );
+
+  await saveCandles(env, symbol, timeframe, candles);
+
+  return json({ ok: true, symbol, timeframe, count: candles.length });
+}
+
 async function handleMarkets() {
   return json({
     ok: true,
@@ -505,15 +532,13 @@ async function handleHistory(request, env) {
     return json({ ok: false, error: "D1 binding DB is not configured" }, 503);
   }
 
-  const candles = await getHistoricalCandles(symbol, timeframe, count, end);
-  await saveCandles(env, symbol, timeframe, candles);
-
   return json({
     ok: true,
     symbol,
     timeframe,
-    count: candles.length,
-    candles
+    count: 0,
+    candles: [],
+    message: "Historical candles are fetched directly from Deriv by the browser and stored through /store-candles."
   });
 }
 
@@ -573,6 +598,10 @@ export default {
         return await handleHistory(request, env);
       }
 
+      if (url.pathname === "/store-candles" && request.method === "POST") {
+        return await handleStoreCandles(request, env);
+      }
+
       if (url.pathname === "/candles" && request.method === "GET") {
         return await handleCandles(request, env);
       }
@@ -588,7 +617,7 @@ export default {
       return json({
         ok: true,
         service: "trading-worker",
-        endpoints: ["/health", "/markets", "/history", "/candles", "/live-candle", "/backtest"]
+        endpoints: ["/health", "/markets", "/history", "/store-candles", "/candles", "/live-candle", "/backtest"]
       });
     } catch (error) {
       return json({
