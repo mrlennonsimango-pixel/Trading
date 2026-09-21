@@ -118,10 +118,10 @@ function createChart() {
   });
   resizeObserver.observe(chartArea);
 
-  chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
-    if (!range || range.from > 25 || loadingOlder || candles.length === 0) return;
-    loadOlderHistory();
-  });
+  // Older history is loaded only when the user presses the button.
+  // Do not auto-load from the visible-range callback because fitContent()
+  // starts at the left edge and live candle updates can trigger this callback
+  // repeatedly, replacing the chart while live data is arriving.
 }
 
 function stopLiveStream() {
