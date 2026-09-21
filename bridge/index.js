@@ -3,7 +3,11 @@ import { WebSocket } from "ws";
 
 const app = express();
 const PORT = Number(process.env.PORT || 10000);
-const DERIV_WS_URLS = [\n  "wss://api.derivws.com/trading/v1/options/ws/public",\n  "wss://ws.binaryws.com/websockets/v3"\n];\nlet derivEndpointIndex = 0;
+const DERIV_WS_URLS = [
+  "wss://api.derivws.com/trading/v1/options/ws/public",
+  "wss://ws.binaryws.com/websockets/v3"
+];
+let derivEndpointIndex = 0;
 
 const ALLOWED_SYMBOLS = new Set([
   "frxEURUSD",
