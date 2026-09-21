@@ -502,19 +502,25 @@ async function collectMarketData(env) {
     throw new Error("D1 binding DB is not configured");
   }
 
-  // Keep the backfill cursor in D1 so each cron run can resume safely.
-  await env.DB.prepare("CREATE TABLE IF NOT EXISTS collector_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')))").run();
+  // Persist the backfill position so each 5-minute cron run resumes from
+  // the oldest candle already downloaded instead of requesting the same
+  // latest candles again.
+  await env.DB.prepare(
+    "CREATE TABLE IF NOT EXISTS collector_state (key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT (datetime('now')))"
+  ).run();
 
-  // Wake the free Render bridge before requesting market data.
   try {
     await fetch(new URL("/health", MARKET_BRIDGE_URL).toString(), {
       cache: "no-store"
     });
   } catch {}
 
-  const INITIAL_HISTORY = 5000;
-  const jobs = [];
+  const TARGET = 5000;
+  // Deriv/bridge responses are effectively limited to about 1,000 candles,
+  // so backfill in 1,000-candle pages.
+  const PAGE_SIZE = 1000;
 
+  const jobs = [];
   for (const market of MARKETS) {
     for (const timeframe of TIMEFRAMES) {
       jobs.push({
@@ -524,16 +530,25 @@ async function collectMarketData(env) {
     }
   }
 
-  // Process only one job per scheduled run. This keeps the free Render
-  // bridge and the Deriv connection stable while the database is built.
-  const cursorRow = await env.DB.prepare(
-    "SELECT value FROM collector_state WHERE key = 'job_cursor'"
+  const stateRow = await env.DB.prepare(
+    "SELECT value FROM collector_state WHERE key = 'backfill'"
   ).first();
 
-  let cursor = Number(cursorRow?.value || 0);
-  if (!Number.isInteger(cursor) || cursor < 0 || cursor >= jobs.length) cursor = 0;
+  let state = {
+    jobIndex: 0,
+    end: "latest"
+  };
 
-  const job = jobs[cursor];
+  try {
+    if (stateRow?.value) {
+      const parsed = JSON.parse(stateRow.value);
+      if (Number.isInteger(parsed.jobIndex) && parsed.jobIndex >= 0 && parsed.jobIndex < jobs.length) {
+        state = parsed;
+      }
+    }
+  } catch {}
+
+  const job = jobs[state.jobIndex];
 
   const existing = await env.DB.prepare(
     `SELECT COUNT(*) AS count
@@ -542,11 +557,28 @@ async function collectMarketData(env) {
   ).bind(job.symbol, job.timeframe).first();
 
   const existingCount = Number(existing?.count || 0);
-  const backfill = existingCount < INITIAL_HISTORY;
-  const count = backfill
-    ? INITIAL_HISTORY
-    : job.timeframe === 60 ? 10 : 3;
 
+  // If this job already has the target amount, advance immediately.
+  if (existingCount >= TARGET) {
+    state.jobIndex = (state.jobIndex + 1) % jobs.length;
+    state.end = "latest";
+
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO collector_state (key, value, updated_at)
+       VALUES ('backfill', ?, datetime('now'))`
+    ).bind(JSON.stringify(state)).run();
+
+    return {
+      mode: "backfill",
+      status: "complete",
+      symbol: job.symbol,
+      timeframe: job.timeframe,
+      databaseCount: existingCount,
+      nextJob: jobs[state.jobIndex]
+    };
+  }
+
+  const end = state.end || "latest";
   let lastError = null;
   let candles = [];
 
@@ -555,8 +587,8 @@ async function collectMarketData(env) {
       const bridgeUrl = new URL("/history", MARKET_BRIDGE_URL);
       bridgeUrl.searchParams.set("symbol", job.symbol);
       bridgeUrl.searchParams.set("granularity", String(job.timeframe));
-      bridgeUrl.searchParams.set("count", String(count));
-      bridgeUrl.searchParams.set("end", "latest");
+      bridgeUrl.searchParams.set("count", String(PAGE_SIZE));
+      bridgeUrl.searchParams.set("end", String(end));
 
       const response = await fetch(bridgeUrl.toString(), {
         cache: "no-store"
@@ -574,6 +606,7 @@ async function collectMarketData(env) {
       }
 
       candles = Array.isArray(data.candles) ? data.candles : [];
+
       if (candles.length > 0) {
         await saveCandles(env, job.symbol, job.timeframe, candles);
       }
@@ -590,37 +623,25 @@ async function collectMarketData(env) {
 
   if (lastError) {
     console.error(
-      "Scheduled collection failed:",
+      "Scheduled backfill failed:",
       JSON.stringify({
         symbol: job.symbol,
         timeframe: job.timeframe,
+        end,
         error: lastError.message
       })
     );
 
-    // Move forward so one problematic market/timeframe cannot block the
-    // entire database build forever.
-    cursor = (cursor + 1) % jobs.length;
-
-    await env.DB.prepare(
-      `INSERT OR REPLACE INTO collector_state (key, value, updated_at)
-       VALUES ('job_cursor', ?, datetime('now'))`
-    ).bind(String(cursor)).run();
-
     return {
-      jobs: jobs.length,
-      processed: 1,
-      successful: 0,
-      failed: 1,
+      mode: "backfill",
+      status: "failed",
       symbol: job.symbol,
       timeframe: job.timeframe,
       error: lastError.message,
-      nextCursor: cursor
+      databaseCount: existingCount
     };
   }
 
-  // If this combination is now fully backfilled, move to the next one.
-  // Otherwise keep the cursor here so another run can retry/fill it.
   const newCountRow = await env.DB.prepare(
     `SELECT COUNT(*) AS count
      FROM candles
@@ -628,48 +649,60 @@ async function collectMarketData(env) {
   ).bind(job.symbol, job.timeframe).first();
 
   const newCount = Number(newCountRow?.count || 0);
-  const completed = newCount >= INITIAL_HISTORY || !backfill;
 
-  if (completed) {
-    cursor = (cursor + 1) % jobs.length;
+  // The bridge/Deriv may legitimately return fewer than PAGE_SIZE candles
+  // when the instrument has less available history. Treat that as the end
+  // of the available history rather than looping forever.
+  const reachedTarget = newCount >= TARGET;
+  const reachedAvailableHistory = candles.length > 0 && candles.length < PAGE_SIZE;
+
+  if (reachedTarget || reachedAvailableHistory) {
+    state.jobIndex = (state.jobIndex + 1) % jobs.length;
+    state.end = "latest";
+  } else if (candles.length > 0) {
+    const timestamps = candles
+      .map(candle => Number(candle.timestamp))
+      .filter(Number.isFinite);
+
+    if (timestamps.length > 0) {
+      const oldest = Math.min(...timestamps);
+      state.end = String(oldest - job.timeframe);
+    }
   }
 
   await env.DB.prepare(
     `INSERT OR REPLACE INTO collector_state (key, value, updated_at)
-     VALUES ('job_cursor', ?, datetime('now'))`
-  ).bind(String(cursor)).run();
+     VALUES ('backfill', ?, datetime('now'))`
+  ).bind(JSON.stringify(state)).run();
 
   console.log(
-    "Scheduled market collection:",
+    "Scheduled market backfill:",
     JSON.stringify({
-      jobs: jobs.length,
-      processed: 1,
-      successful: 1,
-      failed: 0,
       symbol: job.symbol,
       timeframe: job.timeframe,
-      requested: count,
-      stored: candles.length,
+      requested: PAGE_SIZE,
+      received: candles.length,
       databaseCount: newCount,
-      backfill: backfill,
-      completed,
-      nextCursor: cursor
+      endUsed: end,
+      reachedTarget,
+      reachedAvailableHistory,
+      nextJob: jobs[state.jobIndex],
+      nextEnd: state.end
     })
   );
 
   return {
-    jobs: jobs.length,
-    processed: 1,
-    successful: 1,
-    failed: 0,
+    mode: "backfill",
+    status: "ok",
     symbol: job.symbol,
     timeframe: job.timeframe,
-    requested: count,
-    stored: candles.length,
+    requested: PAGE_SIZE,
+    received: candles.length,
     databaseCount: newCount,
-    backfill,
-    completed,
-    nextCursor: cursor
+    reachedTarget,
+    reachedAvailableHistory,
+    nextJob: jobs[state.jobIndex],
+    nextEnd: state.end
   };
 }
 async function handleMarkets() {
