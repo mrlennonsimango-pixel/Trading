@@ -360,26 +360,16 @@ async function handleLiveCandle(request, env) {
   });
 }
 
-async function handleStream(request, env) {
+async function handleLiveTick(request) {
   const url = new URL(request.url);
   const symbol = url.searchParams.get("symbol");
-  const timeframe = Number(url.searchParams.get("timeframe"));
+  const validationError = validateMarketAndTimeframe(symbol, 60);
+  if (validationError) return json({ ok: false, error: validationError }, 400);
 
-  const validationError = validateMarketAndTimeframe(symbol, timeframe);
-  if (validationError) {
-    return json({ ok: false, error: validationError }, 400);
-  }
-
-  // This endpoint is intentionally HTTP-based. Cloudflare Workers cannot
-  // keep a normal fetch handler alive forever, so the browser owns the
-  // persistent Deriv WebSocket subscription for live ticks.
-  return json({
-    ok: true,
-    symbol,
-    timeframe,
-    websocket: DERIV_WS,
-    message: "Use the public Deriv WebSocket for the live tick stream."
-  });
+  const response = await fetch(`${MARKET_BRIDGE_URL}/live?symbol=${encodeURIComponent(symbol)}`);
+  let data;
+  try { data = await response.json(); } catch { return json({ ok: false, error: "Market bridge returned an invalid response" }, 502); }
+  return json(data, response.status);
 }
 
 async function getHistoricalCandles(symbol, granularity, count, end = "latest") {
@@ -624,6 +614,10 @@ export default {
         return await handleHistory(request, env);
       }
 
+      if (url.pathname === "/live-tick" && request.method === "GET") {
+        return await handleLiveTick(request);
+      }
+
       if (url.pathname === "/store-candles" && request.method === "POST") {
         return await handleStoreCandles(request, env);
       }
@@ -643,7 +637,7 @@ export default {
       return json({
         ok: true,
         service: "trading-worker",
-        endpoints: ["/health", "/markets", "/history", "/store-candles", "/candles", "/live-candle", "/backtest"]
+        endpoints: ["/health", "/markets", "/history", "/live-tick", "/store-candles", "/candles", "/live-candle", "/backtest"]
       });
     } catch (error) {
       return json({
