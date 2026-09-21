@@ -34,6 +34,70 @@ function wsRequest(symbol, granularity, count) {
   });
 }
 
+async function getActiveSymbols() {
+  const socket = new WebSocket(DERIV_WS);
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+
+    const finish = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      try { socket.close(); } catch {}
+      fn(value);
+    };
+
+    socket.addEventListener("open", () => {
+      socket.send(JSON.stringify({
+        active_symbols: "brief",
+        product_type: "basic"
+      }));
+    });
+
+    socket.addEventListener("message", event => {
+      try {
+        const message = JSON.parse(event.data);
+
+        if (message.error) {
+          return finish(reject, new Error(message.error.message));
+        }
+
+        if (message.active_symbols) {
+          return finish(resolve, message.active_symbols);
+        }
+      } catch (error) {
+        finish(reject, error);
+      }
+    });
+
+    socket.addEventListener("error", () => {
+      finish(reject, new Error("Deriv WebSocket connection failed"));
+    });
+  });
+}
+
+async function handleStream(request, env) {
+  const url = new URL(request.url);
+  const symbol = url.searchParams.get("symbol");
+  const timeframe = Number(url.searchParams.get("timeframe"));
+
+  const validationError = validateMarketAndTimeframe(symbol, timeframe);
+  if (validationError) {
+    return json({ ok: false, error: validationError }, 400);
+  }
+
+  // This endpoint is intentionally HTTP-based. Cloudflare Workers cannot
+  // keep a normal fetch handler alive forever, so the browser owns the
+  // persistent Deriv WebSocket subscription for live ticks.
+  return json({
+    ok: true,
+    symbol,
+    timeframe,
+    websocket: DERIV_WS,
+    message: "Use the public Deriv WebSocket for the live tick stream."
+  });
+}
+
 async function getHistoricalCandles(symbol, granularity, count, end = "latest") {
   const socket = new WebSocket(DERIV_WS);
 
