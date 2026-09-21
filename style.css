@@ -88,6 +88,16 @@ button {
   font-weight: 600;
 }
 
+.secondary-button {
+  background: #171e27;
+  border-color: #303b47;
+}
+
+.secondary-button:disabled {
+  opacity: .6;
+  cursor: wait;
+}
+
 button:disabled {
   opacity: .6;
   cursor: wait;
