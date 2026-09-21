@@ -34,8 +34,21 @@ function wsRequest(symbol, granularity, count) {
   });
 }
 
+async function connectDerivWebSocket() {
+  const response = await fetch(DERIV_WS.replace("wss://", "https://"), {
+    headers: { Upgrade: "websocket" }
+  });
+
+  if (!response.webSocket) {
+    throw new Error("Deriv WebSocket handshake was not accepted");
+  }
+
+  response.webSocket.accept();
+  return response.webSocket;
+}
+
 async function getActiveSymbols() {
-  const socket = new WebSocket(DERIV_WS);
+  const socket = await connectDerivWebSocket();
 
   return await new Promise((resolve, reject) => {
     let settled = false;
@@ -71,7 +84,7 @@ async function getActiveSymbols() {
     });
 
     socket.addEventListener("error", () => {
-      finish(reject, new Error("Deriv WebSocket connection failed"));
+      finish(reject, new Error("Deriv WebSocket connection failed while requesting market data"));
     });
   });
 }
@@ -382,7 +395,7 @@ async function handleStream(request, env) {
 }
 
 async function getHistoricalCandles(symbol, granularity, count, end = "latest") {
-  const socket = new WebSocket(DERIV_WS);
+  const socket = await connectDerivWebSocket();
 
   return await new Promise((resolve, reject) => {
     let settled = false;
