@@ -31,6 +31,7 @@ let loadingOlder = false;
 let liveSocket = null;
 let liveCandle = null;
 let liveTimeframeSeconds = 60;
+let livePollTimer = null;
 let lastPersistedCandleTime = null;
 let persistTimer = null;
 
@@ -126,10 +127,13 @@ function stopLiveStream() {
     clearTimeout(persistTimer);
     persistTimer = null;
   }
-
   if (liveSocket) {
     try { liveSocket.close(); } catch {}
     liveSocket = null;
+  }
+  if (livePollTimer) {
+    clearInterval(livePollTimer);
+    livePollTimer = null;
   }
   liveCandle = null;
   lastPersistedCandleTime = null;
@@ -137,29 +141,18 @@ function stopLiveStream() {
 
 function persistLiveCandle() {
   if (!liveCandle) return;
-
   const market = selectedMarketObject();
   const timeframe = selectedTimeframeObject();
   if (!market || !timeframe) return;
-
   const candle = { ...liveCandle };
-  const url = `/api/live-candle?symbol=${encodeURIComponent(market.symbol)}&timeframe=${timeframe.value}`;
-
-  fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(candle),
-    keepalive: true
+  fetch(`/api/live-candle?symbol=${encodeURIComponent(market.symbol)}&timeframe=${timeframe.value}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(candle), keepalive: true
   }).catch(() => {});
-
   lastPersistedCandleTime = candle.time;
 }
 
 function scheduleLivePersistence() {
   if (persistTimer) return;
-
-  // Persist periodically while the current candle is forming.
-  // The completed candle is also persisted immediately when the bucket changes.
   persistTimer = setTimeout(() => {
     persistTimer = null;
     persistLiveCandle();
@@ -170,87 +163,36 @@ function scheduleLivePersistence() {
 function subscribeLiveTicks(symbol, timeframeSeconds) {
   stopLiveStream();
   liveTimeframeSeconds = Number(timeframeSeconds);
-
-  liveSocket = new WebSocket("wss://ws.binaryws.com/websockets/v3");
-
-  liveSocket.addEventListener("open", () => {
-    liveSocket.send(JSON.stringify({
-      ticks: symbol,
-      subscribe: 1
-    }));
-    dataStatus.textContent = "Live market data connected.";
-    setStatus("Live", true);
-  });
-
-  liveSocket.addEventListener("message", event => {
+  const poll = async () => {
     try {
-      const message = JSON.parse(event.data);
-
-      if (message.error) {
-        dataStatus.textContent = message.error.message || "Live data error";
-        return;
-      }
-
-      if (message.msg_type !== "tick" || !message.tick) return;
-
-      updateLiveCandle(
-        Number(message.tick.epoch),
-        Number(message.tick.quote)
-      );
+      const response = await fetch(`/api/live-tick?symbol=${encodeURIComponent(symbol)}`, { cache: "no-store" });
+      const data = await response.json();
+      if (!response.ok || !data.ok) return;
+      updateLiveCandle(Number(data.epoch), Number(data.quote));
+      dataStatus.textContent = "Live market data connected through bridge.";
+      setStatus("Live", true);
     } catch {}
-  });
-
-  liveSocket.addEventListener("error", () => {
-    dataStatus.textContent = "Live data connection error.";
-    setStatus("Live error", false);
-  });
-
-  liveSocket.addEventListener("close", () => {
-    if (liveSocket) {
-      dataStatus.textContent = "Live data disconnected. Reloading market data will reconnect.";
-      setStatus("Disconnected", false);
-    }
-  });
+  };
+  poll();
+  livePollTimer = setInterval(poll, 2000);
 }
 
 function updateLiveCandle(epoch, price) {
   if (!Number.isFinite(epoch) || !Number.isFinite(price) || !candleSeries) return;
-
   const bucket = Math.floor(epoch / liveTimeframeSeconds) * liveTimeframeSeconds;
-
   if (!liveCandle || liveCandle.time !== bucket) {
     if (liveCandle) persistLiveCandle();
-
-    liveCandle = {
-      time: bucket,
-      open: price,
-      high: price,
-      low: price,
-      close: price
-    };
-
+    liveCandle = { time: bucket, open: price, high: price, low: price, close: price };
     candles.push(liveCandle);
   } else {
     liveCandle.high = Math.max(liveCandle.high, price);
     liveCandle.low = Math.min(liveCandle.low, price);
     liveCandle.close = price;
   }
-
-  candleSeries.update({
-    time: liveCandle.time,
-    open: liveCandle.open,
-    high: liveCandle.high,
-    low: liveCandle.low,
-    close: liveCandle.close
-  });
-
-  // Keep D1 synchronized while the live candle forms.
-  // A 10-second cadence avoids writing on every tick.
+  candleSeries.update({ time: liveCandle.time, open: liveCandle.open, high: liveCandle.high, low: liveCandle.low, close: liveCandle.close });
   scheduleLivePersistence();
-
   candleCount.textContent = candles.length;
 }
-
 function normaliseCandles(rawCandles) {
   return rawCandles
     .map(candle => ({
