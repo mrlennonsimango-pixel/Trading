@@ -44,7 +44,9 @@ function connectDeriv() {
   lastError = null;
   lastClose = null;
 
-  const endpoint = DERIV_WS_URLS[derivEndpointIndex];\n  console.log("Connecting to Deriv endpoint:", endpoint);\n  const socket = new WebSocket(endpoint);
+  const endpoint = DERIV_WS_URLS[derivEndpointIndex];
+  console.log("Connecting to Deriv endpoint:", endpoint);
+  const socket = new WebSocket(endpoint);
   derivSocket = socket;
 
   connectTimeout = setTimeout(() => {
@@ -53,7 +55,11 @@ function connectDeriv() {
         name: "ConnectionTimeout",
         message: "Deriv WebSocket did not complete its handshake within 10 seconds"
       };
-      derivState = "timeout";\n      lastError = {\n        name: "ConnectionTimeout",\n        message: `Deriv WebSocket timeout: ${endpoint}`\n      };
+      derivState = "timeout";
+      lastError = {
+        name: "ConnectionTimeout",
+        message: `Deriv WebSocket timeout: ${endpoint}`
+      };
       console.error("Deriv WebSocket connection timeout:", endpoint);
       socket.terminate();
     }
