@@ -497,6 +497,81 @@ async function handleStoreCandles(request, env) {
   return json({ ok: true, symbol, timeframe, count: candles.length });
 }
 
+async function collectMarketData(env) {
+  if (!env.DB) {
+    throw new Error("D1 binding DB is not configured");
+  }
+
+  // The bridge may sleep on Render's free tier. Wake/check it first.
+  try {
+    await fetch(new URL("/health", MARKET_BRIDGE_URL).toString(), {
+      cache: "no-store"
+    });
+  } catch {}
+
+  const jobs = [];
+
+  for (const market of MARKETS) {
+    for (const timeframe of TIMEFRAMES) {
+      // Collect more 1M candles so a 5-minute schedule does not leave gaps.
+      const count = timeframe.value === 60 ? 10 : 3;
+      jobs.push({ symbol: market.symbol, timeframe: timeframe.value, count });
+    }
+  }
+
+  const results = await Promise.allSettled(
+    jobs.map(async job => {
+      const bridgeUrl = new URL("/history", MARKET_BRIDGE_URL);
+      bridgeUrl.searchParams.set("symbol", job.symbol);
+      bridgeUrl.searchParams.set("granularity", String(job.timeframe));
+      bridgeUrl.searchParams.set("count", String(job.count));
+      bridgeUrl.searchParams.set("end", "latest");
+
+      const response = await fetch(bridgeUrl.toString(), {
+        cache: "no-store"
+      });
+
+      let data;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error("Invalid bridge response");
+      }
+
+      if (!response.ok || !data.ok) {
+        throw new Error(data.error || "Bridge history request failed");
+      }
+
+      const candles = Array.isArray(data.candles) ? data.candles : [];
+      if (candles.length > 0) {
+        await saveCandles(env, job.symbol, job.timeframe, candles);
+      }
+
+      return {
+        symbol: job.symbol,
+        timeframe: job.timeframe,
+        candles: candles.length
+      };
+    })
+  );
+
+  const successful = results
+    .filter(result => result.status === "fulfilled")
+    .map(result => result.value);
+
+  const failed = results
+    .filter(result => result.status === "rejected")
+    .map(result => result.reason?.message || "Collection failed");
+
+  return {
+    jobs: jobs.length,
+    successful: successful.length,
+    failed: failed.length,
+    stored: successful.reduce((sum, item) => sum + item.candles, 0),
+    errors: failed.slice(0, 10)
+  };
+}
+
 async function handleMarkets() {
   return json({
     ok: true,
@@ -599,6 +674,15 @@ async function handleCandles(request, env) {
 }
 
 export default {
+  async scheduled(_controller, env, _ctx) {
+    try {
+      const result = await collectMarketData(env);
+      console.log("Scheduled market collection:", JSON.stringify(result));
+    } catch (error) {
+      console.error("Scheduled market collection failed:", error);
+    }
+  },
+
   async fetch(request, env) {
     const url = new URL(request.url);
 
